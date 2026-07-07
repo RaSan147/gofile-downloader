@@ -7,7 +7,7 @@ from sys import exit, stdout, stderr
 from typing import Any, Iterator, NoReturn, TextIO
 from types import FrameType
 from itertools import count
-from requests import Session, Response, Timeout
+from requests import Session, Response, RequestException
 from requests.structures import CaseInsensitiveDict
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -17,8 +17,14 @@ from signal import signal, SIGINT, SIG_IGN
 from time import perf_counter, sleep, time
 from re import sub
 
+from terminal_ui import TerminalUI, create_terminal_ui
+from rich.progress import TaskID
+
 
 NEW_LINE: str = "\n" if name != "nt" else "\r\n"
+DEFAULT_PROBE_BYTES: int = 4096
+DEFAULT_RETRY_DELAY: float = 5.0
+MAX_RETRY_DELAY: float = 60.0
 
 
 def has_ansi_support() -> bool:
@@ -81,7 +87,12 @@ def _print(msg: str, error: bool = False) -> None:
     output.flush()
 
 
-def _print_status(status: str, filename: str, details: str = "") -> None:
+def _print_status(
+    status: str,
+    filename: str,
+    details: str = "",
+    ui: TerminalUI | None = None,
+) -> None:
     """
     _print_status
 
@@ -90,8 +101,14 @@ def _print_status(status: str, filename: str, details: str = "") -> None:
     :param status: short status label.
     :param filename: file name being handled.
     :param details: optional extra details.
+    :param ui: optional Rich terminal UI.
     :return:
     """
+
+    if ui is not None:
+        suffix = f" — {details}" if details else ""
+        ui.log(status, f"{filename}{suffix}")
+        return
 
     suffix: str = f" - {details}" if details else ""
     status_colors: dict[str, str] = {
@@ -152,6 +169,9 @@ class Downloader:
         url: str,
         password: str | None = None,
         speed_limit: int = 0,
+        ui: TerminalUI | None = None,
+        probe_bytes: int = DEFAULT_PROBE_BYTES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
     ) -> None:
         """
         Downloader
@@ -188,6 +208,45 @@ class Downloader:
         self._stop_event: Event = stop_event
         self._root_dir: str = root_dir
         self._url: str = url
+        self._ui: TerminalUI | None = ui
+        self._probe_bytes: int = max(probe_bytes, 0)
+        self._retry_delay: float = retry_delay if retry_delay > 0 else DEFAULT_RETRY_DELAY
+
+
+    @staticmethod
+    def _backoff_delay(attempt: int, base_delay: float) -> float:
+        """
+        _backoff_delay
+
+        Computes exponential backoff delay for a retry attempt.
+
+        :param attempt: zero-based attempt index.
+        :param base_delay: base delay in seconds.
+        :return: capped delay in seconds.
+        """
+
+        return min(base_delay * (2 ** attempt), MAX_RETRY_DELAY)
+
+
+    def _wait_before_retry(self, attempt: int, filename: str, reason: str) -> None:
+        """
+        _wait_before_retry
+
+        Logs a retry and sleeps with exponential backoff.
+
+        :param attempt: zero-based attempt index.
+        :param filename: file being downloaded.
+        :param reason: short failure reason.
+        :return:
+        """
+
+        delay: float = self._backoff_delay(attempt, self._retry_delay)
+        details: str = (
+            f"{reason}; retrying in {delay:.0f}s "
+            f"({attempt + 1}/{self._number_retries})"
+        )
+        _print_status("RETRY", filename, details, self._ui)
+        sleep(delay)
 
 
     def run(self) -> None:
@@ -216,9 +275,15 @@ class Downloader:
 
         # removes the root content directory if there's no file or subdirectory
         if path.exists(content_dir) and not listdir(content_dir) and not self._files_info:
-            _print(f"Empty directory for url: {self._url}, nothing done.{NEW_LINE}")
+            if self._ui:
+                self._ui.log("Empty", f"No files found for {content_id}")
+            else:
+                _print(f"Empty directory for url: {self._url}, nothing done.{NEW_LINE}")
             self._remove_dir(content_dir)
             return
+
+        if self._ui:
+            self._ui.begin_batch(content_id, len(self._files_info))
 
         if self._interactive:
             self._do_interactive(content_dir)
@@ -233,14 +298,19 @@ class Downloader:
         Auxiliary function for the requests.session.get.
 
         :param kwargs: arguments for the requests.session.get function.
-        :return: requests.Response or None on requests.Timeout.
+        :return: requests.Response or None after retries are exhausted.
         """
 
-        for _ in range(self._number_retries):
+        for attempt in range(self._number_retries):
             try:
                 return self._session.get(timeout=self._timeout, **kwargs)
-            except Timeout:
+            except RequestException as exc:
+                if attempt + 1 >= self._number_retries:
+                    break
+                self._wait_before_retry(attempt, "request", str(exc))
                 continue
+
+        return None
 
 
     def _threaded_downloads(self) -> None:
@@ -253,11 +323,17 @@ class Downloader:
         """
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            futures = []
             for item in self._files_info.values():
                 if self._stop_event.is_set():
                     return
 
-                executor.submit(self._download_content, item)
+                futures.append(executor.submit(self._download_content, item))
+
+            for future in futures:
+                if self._stop_event.is_set():
+                    return
+                future.result()
 
 
     @staticmethod
@@ -306,29 +382,57 @@ class Downloader:
         tmp_file: str =  f"{filepath}.part"
         url: str = file_info["link"]
         expected_size: int | None = self._parse_expected_size(file_info.get("size"))
+        task_id: TaskID | None = None
 
         if path.isfile(filepath):
             final_size: int = int(path.getsize(filepath))
-            if self._is_complete_file(final_size, expected_size):
-                _print_status("SKIP", filename, "already complete")
-                return
-            move(filepath, tmp_file)
-            _print_status("VERIFY", filename, "existing final file moved to .part")
+            if expected_size is not None and final_size > expected_size:
+                remove(filepath)
+                _print_status("RESTART", filename, "final file larger than expected size", self._ui)
+            elif self._is_complete_file(final_size, expected_size):
+                if self._verify_file_integrity(url, filepath, expected_size):
+                    _print_status("SKIP", filename, "already complete", self._ui)
+                    if self._ui:
+                        self._ui.finish_file_task(None)
+                    return
+                remove(filepath)
+                _print_status("RESTART", filename, "integrity check failed", self._ui)
+            else:
+                move(filepath, tmp_file)
+                _print_status(
+                    "VERIFY",
+                    filename,
+                    "partial final file moved to .part",
+                    self._ui,
+                )
 
         if path.isfile(tmp_file):
             part_size: int = int(path.getsize(tmp_file))
+            if part_size > 0 and not self._verify_partial_head(url, tmp_file, part_size):
+                remove(tmp_file)
+                part_size = 0
+                _print_status("RESTART", filename, "corrupted partial, redownloading", self._ui)
+
             part_action: str = self._evaluate_partial_size(part_size, expected_size)
             if part_action == "restart":
                 remove(tmp_file)
-                _print_status("RESTART", filename, ".part larger than expected size")
+                _print_status("RESTART", filename, ".part larger than expected size", self._ui)
             elif part_action == "complete":
-                move(tmp_file, filepath)
-                _print_status("COMPLETE", filename, "validated existing .part and finalized")
-                return
+                if self._verify_file_integrity(url, tmp_file, expected_size):
+                    move(tmp_file, filepath)
+                    _print_status("COMPLETE", filename, "validated existing .part and finalized", self._ui)
+                    if self._ui:
+                        self._ui.finish_file_task(None)
+                    return
+                remove(tmp_file)
+                _print_status("RESTART", filename, "integrity check failed", self._ui)
             elif part_action == "resume":
-                _print_status("RESUME", filename, f"from byte {part_size}")
+                _print_status("RESUME", filename, f"from byte {part_size}", self._ui)
 
-        for _ in range(self._number_retries):
+        for attempt in range(self._number_retries):
+            if self._stop_event.is_set():
+                return
+
             try:
                 part_size: int = 0
                 headers: dict[str, str] = {}
@@ -336,28 +440,40 @@ class Downloader:
                     part_size = int(path.getsize(tmp_file))
                     headers = {"Range": f"bytes={part_size}-"}
 
+                if self._ui and task_id is None:
+                    task_id = self._ui.add_file_task(filename, expected_size)
+
                 has_size, should_restart = self._perform_download(
                     file_info,
                     url,
                     tmp_file,
                     headers,
-                    part_size
+                    part_size,
+                    task_id,
                 )
-            except Timeout:
+            except RequestException as exc:
+                if attempt + 1 >= self._number_retries:
+                    break
+                self._wait_before_retry(attempt, filename, str(exc))
                 continue
             else:
                 if should_restart:
                     if path.isfile(tmp_file):
                         remove(tmp_file)
-                    _print_status("RESTART", filename, "server ignored Range, downloading from byte 0")
+                    _print_status("RESTART", filename, "server ignored Range, downloading from byte 0", self._ui)
+                    if self._ui and task_id is not None:
+                        self._ui.finish_file_task(task_id)
+                        task_id = None
                     continue
 
                 if has_size:
-                    if self._finalize_download(file_info, tmp_file, int(has_size)):
+                    if self._finalize_download(file_info, tmp_file, int(has_size), task_id, self._ui):
                         return
                 continue
 
-        _print_status("FAILED", filename, "download did not complete, kept .part for retry")
+        _print_status("FAILED", filename, "download did not complete, kept .part for retry", self._ui)
+        if self._ui:
+            self._ui.finish_file_task(task_id)
 
 
     @staticmethod
@@ -394,7 +510,128 @@ class Downloader:
 
         if expected_size is None:
             return False
-        return size_on_disk >= expected_size
+        return size_on_disk == expected_size
+
+
+    @staticmethod
+    def _read_local_range(filepath: str, start: int, length: int) -> bytes:
+        """
+        _read_local_range
+
+        Reads a byte range from a local file.
+
+        :param filepath: path to the local file.
+        :param start: start offset in bytes.
+        :param length: number of bytes to read.
+        :return: bytes read from disk.
+        """
+
+        with open(filepath, "rb") as local_file:
+            local_file.seek(start)
+            return local_file.read(length)
+
+
+    def _fetch_byte_range(self, url: str, start: int, end: int) -> bytes | None:
+        """
+        _fetch_byte_range
+
+        Downloads an inclusive byte range from a remote file.
+
+        :param url: file download URL.
+        :param start: first byte offset to fetch.
+        :param end: last byte offset to fetch.
+        :return: fetched bytes or None on failure.
+        """
+
+        if end < start:
+            return b""
+
+        response: Response | None = self._get_response(
+            url=url,
+            headers={"Range": f"bytes={start}-{end}"},
+            stream=True,
+        )
+        if not response:
+            return None
+
+        with response:
+            if response.status_code not in (200, 206):
+                return None
+            return b"".join(
+                response.iter_content(chunk_size=max(self._chunk_size, end - start + 1))
+            )
+
+
+    def _verify_byte_range(self, url: str, filepath: str, start: int, length: int) -> bool:
+        """
+        _verify_byte_range
+
+        Compares a local byte range with the same range from the remote file.
+
+        :param url: file download URL.
+        :param filepath: path to the local file.
+        :param start: start offset in bytes.
+        :param length: number of bytes to compare.
+        :return: True when the ranges match.
+        """
+
+        if length <= 0:
+            return True
+
+        local_bytes: bytes = self._read_local_range(filepath, start, length)
+        remote_bytes: bytes | None = self._fetch_byte_range(url, start, start + length - 1)
+        return remote_bytes is not None and local_bytes == remote_bytes
+
+
+    def _verify_partial_head(self, url: str, filepath: str, local_size: int) -> bool:
+        """
+        _verify_partial_head
+
+        Verifies the first bytes of a partial download against the remote source.
+
+        :param url: file download URL.
+        :param filepath: path to the local partial file.
+        :param local_size: current local file size.
+        :return: True when the leading bytes match.
+        """
+
+        if self._probe_bytes <= 0 or local_size <= 0:
+            return True
+
+        head_length: int = min(self._probe_bytes, local_size)
+        return self._verify_byte_range(url, filepath, 0, head_length)
+
+
+    def _verify_file_integrity(
+        self,
+        url: str,
+        filepath: str,
+        expected_size: int | None,
+    ) -> bool:
+        """
+        _verify_file_integrity
+
+        Verifies leading and trailing byte ranges for a complete local file.
+
+        :param url: file download URL.
+        :param filepath: path to the local file.
+        :param expected_size: expected final file size.
+        :return: True when both ends match the remote file.
+        """
+
+        if self._probe_bytes <= 0 or not expected_size or expected_size <= 0:
+            return True
+
+        head_length: int = min(self._probe_bytes, expected_size)
+        if not self._verify_byte_range(url, filepath, 0, head_length):
+            return False
+
+        tail_length: int = min(self._probe_bytes, expected_size)
+        tail_start: int = expected_size - tail_length
+        if tail_start <= 0:
+            return True
+
+        return self._verify_byte_range(url, filepath, tail_start, tail_length)
 
 
     @staticmethod
@@ -427,6 +664,7 @@ class Downloader:
         tmp_file: str,
         headers: dict[str, str],
         part_size: int,
+        task_id: TaskID | None = None,
     ) -> tuple[str | None, bool]:
         """
         _perform_download
@@ -481,7 +719,8 @@ class Downloader:
                 tmp_file,
                 part_size,
                 float(has_size),
-                file_info["filename"]
+                file_info["filename"],
+                task_id,
             )
 
             return has_size, False
@@ -537,7 +776,8 @@ class Downloader:
         tmp_file: str,
         part_size: int,
         total_size: float,
-        filename: str
+        filename: str,
+        task_id: TaskID | None = None,
     ) -> None:
         """
         _write_chunks
@@ -563,7 +803,10 @@ class Downloader:
                 f.write(chunk)
                 downloaded += len(chunk)
                 self._apply_speed_limit(downloaded, start_time)
-                self._update_progress(filename, part_size, downloaded, total_size, start_time)
+                if self._ui and task_id is not None:
+                    self._ui.update_file_task(task_id, part_size + downloaded)
+                else:
+                    self._update_progress(filename, part_size, downloaded, total_size, start_time)
 
 
     def _apply_speed_limit(self, downloaded: int, start_time: float) -> None:
@@ -632,7 +875,13 @@ class Downloader:
 
 
     @staticmethod
-    def _finalize_download(file_info: dict[str, str], tmp_file: str, expected_size: int) -> bool:
+    def _finalize_download(
+        file_info: dict[str, str],
+        tmp_file: str,
+        expected_size: int,
+        task_id: TaskID | None = None,
+        ui: TerminalUI | None = None,
+    ) -> bool:
         """
         _finalize_download
 
@@ -649,13 +898,16 @@ class Downloader:
 
         size_on_disk: int = int(path.getsize(tmp_file))
         if size_on_disk == expected_size:
-            _print(
-                f"{TERMINAL_CLEAR_LINE}"
-                f"Downloading {file_info['filename']}: {size_on_disk} "
-                f"of {expected_size} Done!{NEW_LINE}"
-            )
+            if ui is None:
+                _print(
+                    f"{TERMINAL_CLEAR_LINE}"
+                    f"Downloading {file_info['filename']}: {size_on_disk} "
+                    f"of {expected_size} Done!{NEW_LINE}"
+                )
             move(tmp_file, path.join(file_info["path"], file_info["filename"]))
-            _print_status("COMPLETE", file_info["filename"])
+            _print_status("COMPLETE", file_info["filename"], ui=ui)
+            if ui:
+                ui.finish_file_task(task_id)
             return True
         return False
 
@@ -854,14 +1106,22 @@ class Downloader:
         :return:
         """
 
-        self._print_list_files()
+        if self._ui:
+            self._ui.pause()
 
-        # Ensure only valid index strings are stored.
-        input_list: set[str] = set(input(
-            f"Files to download (Ex: 1 3 7) | or leave empty to download them all"
-            f"{NEW_LINE}"
-            f":: "
-        ).split())
+        try:
+            self._print_list_files()
+
+            # Ensure only valid index strings are stored.
+            input_list: set[str] = set(input(
+                f"Files to download (Ex: 1 3 7) | or leave empty to download them all"
+                f"{NEW_LINE}"
+                f":: "
+            ).split())
+        finally:
+            if self._ui:
+                self._ui.resume()
+
         input_list = set(self._files_info.keys()) if not input_list \
                      else input_list & set(self._files_info.keys())
 
@@ -892,6 +1152,8 @@ class Manager:
         speed_limit: int | None = None,
         batch_threads: int | None = None,
         token: str | None = None,
+        probe_bytes: int | None = None,
+        retry_delay: float | None = None,
     ) -> None:
         """
         Manager
@@ -937,6 +1199,20 @@ class Manager:
         if self._speed_limit < 0:
             self._speed_limit = 0
         self._token: str | None = token if token is not None else getenv("GF_TOKEN")
+        self._probe_bytes: int = (
+            probe_bytes
+            if probe_bytes is not None
+            else self._read_int_env("GF_PROBE_BYTES", DEFAULT_PROBE_BYTES, allow_zero=True)
+        )
+        if self._probe_bytes < 0:
+            self._probe_bytes = DEFAULT_PROBE_BYTES
+        self._retry_delay: float = (
+            retry_delay
+            if retry_delay is not None
+            else self._read_float_env("GF_RETRY_DELAY", DEFAULT_RETRY_DELAY)
+        )
+        if self._retry_delay <= 0:
+            self._retry_delay = DEFAULT_RETRY_DELAY
 
         self._password: str | None = password
         self._url_or_file: str = url_or_file
@@ -945,6 +1221,7 @@ class Manager:
         self._stop_event: Event = Event()
         selected_root: str | None = root_dir if root_dir is not None else env_root_dir
         self._root_dir: str = selected_root if selected_root else getcwd()
+        self._ui: TerminalUI | None = None
 
         self._session.headers.update({
             "Accept-Encoding": "gzip",
@@ -978,6 +1255,9 @@ class Manager:
                 self._url_or_file,
                 self._password,
                 self._speed_limit,
+                self._ui,
+                self._probe_bytes,
+                self._retry_delay,
             )
 
             downloader.run()
@@ -1008,6 +1288,9 @@ class Manager:
                     url,
                     password,
                     self._speed_limit,
+                    self._ui,
+                    self._probe_bytes,
+                    self._retry_delay,
                 )
 
                 executor.submit(downloader.run)
@@ -1023,8 +1306,21 @@ class Manager:
         """
 
         signal(SIGINT, self._handle_sigint)
+        self._ui = create_terminal_ui()
+
+        if self._ui:
+            with self._ui:
+                self._run_downloads()
+            return
+
         _print_banner()
         _print(f"Starting, please wait...{NEW_LINE}")
+        self._run_downloads()
+
+
+    def _run_downloads(self) -> None:
+        if self._ui:
+            self._ui.log("Ready", "Authenticating with GoFile...")
         self._set_account_access_token(self._token)
         self._parse_url_or_file()
 
@@ -1096,7 +1392,7 @@ class Manager:
         user_agent: str = str(self._session.headers.get("User-Agent", "Mozilla/5.0"))
         wt: str = generate_website_token(user_agent, "")
 
-        for _ in range(self._number_retries):
+        for attempt in range(self._number_retries):
             try:
                 response = self._session.post(
                     "https://api.gofile.io/accounts",
@@ -1106,10 +1402,18 @@ class Manager:
                     },
                     timeout=self._timeout
                 ).json()
-            except Timeout:
-                continue
-            else:
                 break
+            except RequestException:
+                if attempt + 1 >= self._number_retries:
+                    break
+                delay: float = Downloader._backoff_delay(attempt, self._retry_delay)
+                if self._ui:
+                    self._ui.log(
+                        "RETRY",
+                        f"Authentication failed; retrying in {delay:.0f}s "
+                        f"({attempt + 1}/{self._number_retries})",
+                    )
+                sleep(delay)
 
         if not response and response["status"] != "ok":
             die("Account creation failed!")
@@ -1127,7 +1431,10 @@ class Manager:
         :return:
         """
 
-        _print(f"{TERMINAL_CLEAR_LINE}Stopping, please wait...{NEW_LINE}")
+        if self._ui:
+            self._ui.log("Stopping", "Waiting for active downloads to finish...")
+        else:
+            _print(f"{TERMINAL_CLEAR_LINE}Stopping, please wait...{NEW_LINE}")
         self._stop_event.set()
 
 
@@ -1185,11 +1492,17 @@ def _build_parser() -> ArgumentParser:
     parser.add_argument("--parallel-downloads", type=int, help="How many files to download in parallel")
     parser.add_argument("--threads", type=int, help="How many batch threads to run")
     parser.add_argument("--speed-limit", help="Per-download limit in B/s (supports k/m/g suffixes)")
-    parser.add_argument("--max-retries", type=int, help="Maximum retries on timeout")
+    parser.add_argument("--max-retries", type=int, help="Maximum retries on network errors")
+    parser.add_argument("--retry-delay", type=float, help="Base delay in seconds between retries")
     parser.add_argument("--timeout", type=float, help="Connection timeout in seconds")
     parser.add_argument("--chunk-size", type=int, help="Chunk size in bytes")
     parser.add_argument("--user-agent", help="Custom user-agent")
     parser.add_argument("--token", help="Account token")
+    parser.add_argument(
+        "--probe-bytes",
+        type=int,
+        help="Bytes to compare at each end for integrity checks (0 disables)",
+    )
     return parser
 
 
@@ -1202,6 +1515,10 @@ def _collect_interactive_cli_values() -> Namespace:
     parallel_downloads: str = _prompt_with_default("Parallel downloads (files)", "5")
     threads: str = _prompt_with_default("Threads total (batch)", parallel_downloads)
     speed_limit: str = _prompt_with_default("Speed limit per download (B/s, 0 = unlimited)", "0")
+    probe_bytes: str = _prompt_with_default(
+        "Integrity probe bytes at each end (0 = size-only checks)",
+        str(DEFAULT_PROBE_BYTES),
+    )
     interactive: bool = _prompt_bool("Enable file selection prompt", True)
 
     return Namespace(
@@ -1212,7 +1529,9 @@ def _collect_interactive_cli_values() -> Namespace:
         parallel_downloads=int(parallel_downloads),
         threads=int(threads),
         speed_limit=speed_limit,
+        probe_bytes=int(probe_bytes),
         max_retries=None,
+        retry_delay=None,
         timeout=None,
         chunk_size=None,
         user_agent=None,
@@ -1247,6 +1566,8 @@ def main() -> None:
         speed_limit=speed_limit,
         batch_threads=args.threads,
         token=args.token,
+        probe_bytes=args.probe_bytes,
+        retry_delay=args.retry_delay,
     )
     manager.run()
 

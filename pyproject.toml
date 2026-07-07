@@ -10,10 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.33.1",
+    "rich>=13.0.0",
 ]
 
 [project.scripts]
 gofile-downloader = "gofile_downloader:main"
 
 [tool.setuptools]
-py-modules = ["gofile_downloader"]
+py-modules = ["gofile_downloader", "terminal_ui"]
