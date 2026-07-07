@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "gofile-downloader"
 version = "0.1.0"
@@ -7,3 +11,9 @@ requires-python = ">=3.10"
 dependencies = [
     "requests>=2.33.1",
 ]
+
+[project.scripts]
+gofile-downloader = "gofile_downloader:main"
+
+[tool.setuptools]
+py-modules = ["gofile_downloader"]
