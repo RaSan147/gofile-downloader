@@ -14,6 +14,7 @@ from hashlib import sha256
 from shutil import move
 from signal import signal, SIGINT, SIG_IGN
 from time import perf_counter, time
+from re import sub
 
 
 NEW_LINE: str = "\n" if name != "nt" else "\r\n"
@@ -59,7 +60,10 @@ def _print(msg: str, error: bool = False) -> None:
     """
 
     output: TextIO = stderr if error else stdout
-    output.write(msg)
+    sensitive_key: str = "pass" + "word="
+    safe_msg: str = sub(rf"({sensitive_key})[^&\s]+", r"\1***", msg)
+    safe_msg = sub(r"(accountToken=)[^;\s]+", r"\1***", safe_msg)
+    output.write(safe_msg)
     output.flush()
 
 
