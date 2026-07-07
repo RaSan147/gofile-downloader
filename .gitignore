@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+/osiPk0
+
+# Local reference clone
+reference/
