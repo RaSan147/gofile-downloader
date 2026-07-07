@@ -7,7 +7,7 @@ from threading import Event
 from requests import Session
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "gofile-downloader.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "gofile_downloader.py"
 spec = importlib.util.spec_from_file_location("gofile_downloader", MODULE_PATH)
 module = importlib.util.module_from_spec(spec)
 assert spec and spec.loader

@@ -6,58 +6,79 @@ Download files from https://gofile.io
 
 #### Requirements
 
-- Python version 3.10 or newer.
-- **[uv](https://docs.astral.sh/uv/getting-started/installation/)**: A blazing-fast Python package and project manager. (If you have pip installed, you can use it to install uv: `pip install uv`)
+- Python 3.10+
+- `pip` (or `uv`)
 
 ---
 
-#### Dependencies
+#### Setup
 
-With `uv`, you don't need to manually install dependencies or manage virtual environments. The `uv run` command handles everything automatically on the fly.
+```bash
+./setup.sh
+```
 
-_(Optional: If you just want to install the dependencies without running the script, use `uv sync`)_
+```bat
+setup.bat
+```
+
+Or install directly:
+
+```bash
+python -m pip install .
+```
 
 ---
 
 #### Usage
 
-```
-uv run gofile-downloader.py https://gofile.io/d/contentid
+```bash
+python gofile_downloader.py https://gofile.io/d/contentid
 ```
 
 If it has password:
 
-```
-uv run gofile-downloader.py https://gofile.io/d/contentid password
+```bash
+python gofile_downloader.py https://gofile.io/d/contentid password
 ```
 
 If you have a text file with multiple urls:
 
-```
+```text
 https://gofile.io/d/contentid1
 https://gofile.io/d/contentid2
 https://gofile.io/d/contentid3
 https://gofile.io/d/contentid4
 ```
 
-```
-uv run gofile-downloader.py my-urls.txt
-```
-
-If you specify a password, this password will be used for ALL urls provided in the text file:
-
-```
-uv run gofile-downloader.py my-urls.txt password
+```bash
+python gofile_downloader.py my-urls.txt
 ```
 
-It's possible to provide per link password, just don't pass the password altogether, provide the password in the text file separated by a space.
+If you specify a password, this password is used for all urls in the text file:
 
+```bash
+python gofile_downloader.py my-urls.txt password
 ```
-https://gofile.io/d/contentid1 password1
-https://gofile.io/d/contentid2
-https://gofile.io/d/contentid3
-https://gofile.io/d/contentid4 password4
+
+You can also start interactive mode by running without arguments:
+
+```bash
+python gofile_downloader.py
 ```
+
+Common CLI flags:
+
+```bash
+python gofile_downloader.py <target> [password] \
+  --parallel-downloads 5 \
+  --threads 5 \
+  --speed-limit 5m \
+  --interactive
+```
+
+- `--parallel-downloads`: how many files to download in parallel.
+- `--threads`: max total batch threads (for url-list file input).
+- `--speed-limit`: per-download speed limit in bytes/sec (supports `k`, `m`, `g`).
 
 ---
 
@@ -80,8 +101,6 @@ https://gofile.io/d/contentid4 password4
 
 #### Environment Variables
 
-The script behavior can be customized using environment variables. Instead of passing them via your terminal (which changes depending on your OS), you can simply create a `.env` file in the root directory of this project. `uv` will load them automatically.
-
 Create a `.env` file and set your desired configurations:
 
 ```env
@@ -94,8 +113,14 @@ GF_INTERACTIVE="1"
 # Specify a specific account token
 GF_TOKEN="your_account_token_here"
 
-# Configure the maximum number of concurrent downloads
+# Configure the maximum number of concurrent file downloads
 GF_MAX_CONCURRENT_DOWNLOADS="5"
+
+# Configure max batch threads (url-list file input)
+GF_MAX_BATCH_THREADS="5"
+
+# Configure per-download speed limit in bytes/sec (0 = unlimited)
+GF_SPEED_LIMIT="0"
 
 # Configure the number of retries on timeout
 GF_MAX_RETRIES="5"
