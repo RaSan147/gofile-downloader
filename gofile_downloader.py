@@ -47,6 +47,19 @@ def has_ansi_support() -> bool:
 # I hope these 100 character are enough for fallback,
 # anyone using win7 still?
 TERMINAL_CLEAR_LINE: str = f"\r{' ' * 100} \r" if not has_ansi_support() else "\033[2K\r"
+ANSI_ENABLED: bool = has_ansi_support()
+ANSI_RESET: str = "\033[0m" if ANSI_ENABLED else ""
+ANSI_DIM: str = "\033[2m" if ANSI_ENABLED else ""
+ANSI_CYAN: str = "\033[36m" if ANSI_ENABLED else ""
+ANSI_GREEN: str = "\033[32m" if ANSI_ENABLED else ""
+ANSI_YELLOW: str = "\033[33m" if ANSI_ENABLED else ""
+ANSI_RED: str = "\033[31m" if ANSI_ENABLED else ""
+
+
+def _color(text: str, color: str) -> str:
+    if not ANSI_ENABLED:
+        return text
+    return f"{color}{text}{ANSI_RESET}"
 
 
 def _print(msg: str, error: bool = False) -> None:
@@ -81,7 +94,23 @@ def _print_status(status: str, filename: str, details: str = "") -> None:
     """
 
     suffix: str = f" - {details}" if details else ""
-    _print(f"{TERMINAL_CLEAR_LINE}[{status}] {filename}{suffix}{NEW_LINE}")
+    status_colors: dict[str, str] = {
+        "COMPLETE": ANSI_GREEN,
+        "SKIP": ANSI_CYAN,
+        "RESUME": ANSI_CYAN,
+        "VERIFY": ANSI_YELLOW,
+        "RESTART": ANSI_YELLOW,
+        "FAILED": ANSI_RED,
+    }
+    label: str = _color(f"[{status}]", status_colors.get(status, ANSI_DIM))
+    _print(f"{TERMINAL_CLEAR_LINE}{label} {filename}{suffix}{NEW_LINE}")
+
+
+def _print_banner() -> None:
+    title: str = _color("GOFILE DOWNLOADER", ANSI_CYAN)
+    _print(f"{ANSI_DIM}{'-' * 28}{ANSI_RESET}{NEW_LINE}")
+    _print(f"{title}{NEW_LINE}")
+    _print(f"{ANSI_DIM}{'-' * 28}{ANSI_RESET}{NEW_LINE}")
 
 
 def die(msg: str) -> NoReturn:
@@ -994,6 +1023,7 @@ class Manager:
         """
 
         signal(SIGINT, self._handle_sigint)
+        _print_banner()
         _print(f"Starting, please wait...{NEW_LINE}")
         self._set_account_access_token(self._token)
         self._parse_url_or_file()
